@@ -1,0 +1,47 @@
+model:
+  name: Swin3D
+  patch_size: [ 4, 4, 34 ]
+  num_classes: 4
+  in_channels: 1
+  embed_dim: 96
+  depths: [ 2, 2 ]
+  heads: [ 3, 6 ]
+  window_size: [ 4, 4, 8 ]
+  ff_ratio: 4.0
+  qkv_bias: True
+  dropout: 0.2
+  attn_dropout: 0.2
+  dropout_path: 0.1
+  norm: LayerNorm
+  patch_norm: True
+  frozen_stages: -1
+  extra_features_dim: 3
+
+
+data:
+  name: rd
+  data_root: /home/nju-student/mkh/datasets/radar
+  seed: 42
+  val_ratio: 0.2
+  shuffle: True
+  batch_size: 16
+  num_workers: 4
+  image_seq_len: 64
+  track_seq_len: 20
+  height: 32
+  width: 544
+  save_path: ./results
+
+
+train:
+  epochs: 1400
+  lr: 0.01
+  scheduler:
+    name: MultiStepLR
+    gamma: 0.5
+    milestones: [ 500, 800, 1000, 1200 ]
+  optimizer:
+    name: SGD
+    momentum: 0.9
+    weight_decay: 0.0005
+  log_dir: ../logs/rd
