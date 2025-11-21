@@ -1,149 +1,85 @@
 import torch
 import torch.nn as nn
 import lightning as pl
-import numpy as np
-from tsai.models.MultiRocketPlus import MultiRocketBackbonePlus
-from typing import Dict, Tuple
+from thop import profile
+from typing import Optional
 
-from src.low_slow_small_object_classification.data.track_preprocessor import TrajectoryPreprocessor
 from src.low_slow_small_object_classification.utils.logger import default_logger as logger
 from src.low_slow_small_object_classification.utils.config import get_optimizer, get_scheduler
 from src.low_slow_small_object_classification.models.utils import calc_rate
+from src.low_slow_small_object_classification.models.multi_rocket import MultiRocketClassifier
+from src.low_slow_small_object_classification.models.swin3d import SwinTransformer3D
 
 
-np.seterr(all='raise')
-
-# region MultiRocket
-
-class MultiRocketModel(nn.Module):
-    def __init__(self, c_in: int, c_out: int, seq_len: int, num_features: int = 20_000, dropout: float = 0.2, **kwargs):
+class StackingModel(nn.Module):
+    def __init__(self, swin: SwinTransformer3D, rocket: MultiRocketClassifier,
+                 hidden_channels: int, num_classes: int, freeze_stage: int):
         super().__init__()
 
-        self.c_in = c_in
-        self.c_out = c_out
-        self.seq_len = seq_len
-        self.num_features = num_features
-        self.dropout = dropout
-
-        self.backbone = MultiRocketBackbonePlus(c_in, seq_len, num_features, **kwargs)
-        backbone_out_features = self.backbone.num_features
-        self.fc = nn.Sequential(
-            nn.Flatten(),
-            nn.BatchNorm1d(backbone_out_features),
-            nn.Dropout(dropout),
-            nn.Linear(backbone_out_features, c_out),
+        self.num_classes = num_classes
+        self.freeze_stage = freeze_stage
+        self.swin = swin
+        self.rocket = rocket
+        self.classifier = nn.Sequential(
+            nn.Linear(2 * num_classes, hidden_channels),
+            nn.ReLU(),
+            nn.BatchNorm1d(hidden_channels),
+            nn.Linear(hidden_channels, num_classes),
+            nn.Softmax(dim=1),
         )
-        self.head = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(c_out, c_out),
-        )
+        self.freeze()
 
-    def forward(self, x: torch.Tensor, last_logits: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        batch_size = x.shape[0]
-        fea = self.backbone(x)
-        x = self.fc(fea)
-        if last_logits is None:
-            last_logits = torch.ones((batch_size, self.c_out), dtype=x.dtype, device=x.device) / self.c_out
-        x = x + last_logits
-        x = self.head(x)
-        return x
+    def freeze(self):
+        if self.freeze_stage == 1:
+            self.swin.requires_grad_(False)
+            self.rocket.requires_grad_(False)
+        elif self.freeze_stage == 2:
+            self.requires_grad_(False)
+
+    def forward(self, sequences, rd_matrices=None, extra_features=None, mask=None, last_logits=None):
+        if rd_matrices is None:
+            return self.rocket(sequences, last_logits)
+        swin_out = self.swin(rd_matrices, extra_features, mask)[0]
+        rocket_out = self.rocket(sequences, last_logits)[0]
+        x = self.classifier(torch.cat([rocket_out, swin_out], dim=1))
+        return x, rocket_out
 
 
-class MultiRocketClassifier(nn.Module):
-    def __init__(self, c_in: int, c_out: int, seq_len: int, num_features: int = 20_000,
-                 dropout: float = 0.2, confidence_threshold: float = 0.9, **kwargs):
-        super().__init__()
-
-        self.c_in = c_in
-        self.c_out = c_out
-        self.seq_len = seq_len
-        self.num_features = num_features
-        self.dropout = dropout
-        self.confidence_threshold = confidence_threshold
-        self.support_lengths = self._get_support_lengths()
-        self.models = nn.ModuleList([])
-
-        for i in range(1, self.seq_len + 1):
-            length = self._find_support_length(i)
-            self.models.append(MultiRocketModel(
-                c_in=c_in,
-                c_out=c_out,
-                seq_len=length,
-                num_features=num_features,
-                dropout=dropout,
-                **kwargs,
-            ))
-
-    def _get_support_lengths(self):
-        lengths = [i for i in range(10, self.seq_len + 1)]
-        lengths.remove(17)
-        lengths.remove(25)
-        return lengths
-
-    def _find_support_length(self, length):
-        for i in self.support_lengths:
-            if i >= length:
-                return i
-        return self.support_lengths[-1]
-
-    def preprocess(self, x: torch.Tensor) -> torch.Tensor:
-        batch_size, num_features, seq_len = x.shape
-        if seq_len < 10:
-            temp = torch.zeros((batch_size, num_features, 10)).to(x)
-            temp[:, :, :seq_len] = x
-            temp[:, -2, seq_len:] = 1
-            temp[:, -1, :] = -1
-            x = temp
-
-        target_len = self._find_support_length(seq_len)
-        if x.shape[2] < target_len:
-            padded_data = []
-            for i in range(batch_size):
-                pad_data = x[i].cpu().numpy().T
-                pad_data = TrajectoryPreprocessor.data_padding(pad_data, target_len, n=1).T
-                padded_data.append(torch.from_numpy(pad_data).to(x))
-            x = torch.cat([x, torch.stack(padded_data)], dim=2)
-
-        return x
-
-    def forward(self, x: torch.Tensor, last_logits: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        seq_len = x.shape[2]
-        x = self.preprocess(x)
-        logits = self.models[seq_len - 1](x, last_logits)
-        probs = torch.softmax(logits, dim=1)
-        return logits, probs
-
-# endregion
-
-# region Lightning Module
-
-class MultiRocket(pl.LightningModule):
+class StackingModule(pl.LightningModule):
     def __init__(self, config):
         super().__init__()
 
         self.config = config
-        model_config = config["model"]
-        model_config.pop("name", None)
-        self.model = MultiRocketClassifier(**model_config)
-        self.automatic_optimization = False
+        model_config = config['model']
+        swin_config = model_config['rd']
+        rocket_config = model_config['track']
+        self.swin = SwinTransformer3D(**swin_config)
+        self.rocket = MultiRocketClassifier(**rocket_config)
+        self.num_classes = model_config['num_classes']
+        self.model = StackingModel(
+            self.swin, self.rocket,
+            model_config['hidden_channels'],
+            self.num_classes,
+            model_config['freeze_stage']
+        )
 
-        self.seq_len = model_config["seq_len"]
+        self.seq_len = config["data"]["track_seq_len"]
         self.criterion = nn.CrossEntropyLoss()
+        self.loss = 0.
         self.accuracies = torch.zeros(self.seq_len)
         self.count = 0
-        self.num_classes = model_config["c_out"]
-        self.conf_matrix = torch.zeros((self.num_classes, self.num_classes))
+        self.num_classes = model_config["num_classes"]
+        self.conf_matrix = torch.zeros(self.num_classes, self.num_classes)
 
     def configure_optimizers(self):
         train_config = self.config["train"]
-        optimizers = []
-        schedulers = []
-        for i in range(self.seq_len):
-            optimizer = get_optimizer(train_config, self.model.models[i])
-            optimizers.append(optimizer)
-            schedulers.append(get_scheduler(train_config, optimizer))
-
-        return optimizers, schedulers
+        optimizer = get_optimizer(train_config, self.model)
+        scheduler = get_scheduler(train_config, optimizer)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": scheduler,
+            "monitor": "val/loss"
+        }
 
     def update_conf_matrix(self, predictions, labels):
         for i in range(len(predictions)):
@@ -153,35 +89,47 @@ class MultiRocket(pl.LightningModule):
             label = labels[i]
             self.conf_matrix[int(label), int(pred_label)] += 1
 
-    def forward(self, t, sequence, last_logits):
-        x = sequence[:, :, :t]
-        output = self.model(x, last_logits)
-        return output
+    def forward(self, t, sequence: torch.Tensor, last_logits: Optional[torch.Tensor] = None,
+                rd_matrices: Optional[torch.Tensor] = None, point_index: Optional[torch.Tensor] = None,
+                extra_features: Optional[torch.Tensor] = None, mask: Optional[torch.Tensor] = None):
+        sequence_t = sequence[:, :, :t]
+        if rd_matrices is None:
+            probs, logits = self.model(sequence_t, last_logits=last_logits)
+        else:
+            index_mask_t = (point_index <= t)
+            rd_matrix_t = rd_matrices * index_mask_t.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+            mask_t = mask * index_mask_t if mask is not None else None
+            extra_features_t = torch.stack([
+                extra_features[i, point_index[i] <= t].mean(0) for i in range(len(extra_features))
+            ])
+            probs, logits = self.model(sequence_t, rd_matrix_t, extra_features_t, mask_t, last_logits)
+        return probs, logits
 
     def step(self, batch, require_conf=False):
         sequence = batch["sequence"].transpose(1, 2)
         labels = batch["label"]
         last_logits = torch.ones((sequence.shape[0], self.num_classes)).to(sequence) / self.num_classes
+        rd_matrices = batch.get("rd_matrices", None)
+        point_index = batch.get("point_index", None)
+        extra_features = batch.get("extra_features", None)
+        mask = batch.get("mask", None)
 
-        b = sequence.shape[0]
+        b = point_index.shape[0]
         accuracy = torch.zeros(self.seq_len)
         accuracy_by_class = torch.zeros(self.num_classes, self.seq_len)
         begin_time = torch.ones(b) * self.seq_len
         begin = [False for _ in range(b)]
         prediction = torch.zeros((b, self.seq_len))
         total_loss = 0.
-        loss_by_step = []
         for t in range(1, self.seq_len + 1):
-            logits, probs = self.forward(t, sequence, last_logits)
+            probs, logits = self.forward(t, sequence, last_logits, rd_matrices, point_index, extra_features, mask)
             last_logits = logits
             loss = self.criterion(probs, labels)
             total_loss += loss
-            loss_by_step.append(loss.item())
 
-            _, pred = torch.max(probs, 1)
+            _, pred = probs.max(1)
             prediction[:, t - 1] = pred
-            accuracy[t - 1] = (pred == labels).float().mean()
-            sequence[:, -1, t - 1] = pred.float()
+            accuracy[t - 1] = (pred == labels).float().mean().item()
             for i in range(self.num_classes):
                 accuracy_by_class[i, t - 1] = (pred[labels == i] == i).float().mean().item()
 
@@ -199,7 +147,6 @@ class MultiRocket(pl.LightningModule):
 
         result = {
             "loss": total_loss,
-            "loss_by_step": loss_by_step,
             "begin_time": begin_time.mean(),
             "rate": rate,
             "accuracy": accuracy,
@@ -224,7 +171,6 @@ class MultiRocket(pl.LightningModule):
         result = self.step(batch)
 
         self.loss = result["loss"]
-        self.loss_by_step = result["loss_by_step"]
         begin_time = result["begin_time"]
         rate = result["rate"]
         accuracy = result["accuracy"]
@@ -232,13 +178,6 @@ class MultiRocket(pl.LightningModule):
         strict_accuracy = result["strict_accuracy"]
         self.accuracies += b * accuracy
         self.count += b
-
-        optimizers = self.optimizers()
-        for optimizer in optimizers:
-            optimizer.zero_grad()
-        self.manual_backward(self.loss)
-        for optimizer in optimizers:
-            optimizer.step()
 
         self.log_dict({
             "train/loss": self.loss,
@@ -250,17 +189,14 @@ class MultiRocket(pl.LightningModule):
         for i in range(len(accuracy_by_class)):
             self.log(f"train/acc_cls_{i}", accuracy_by_class[i], on_step=False, on_epoch=True, batch_size=b)
 
+        return self.loss
+
     def on_train_epoch_end(self):
-        schedulers = self.lr_schedulers()
-        lrs = []
-        for i, scheduler in enumerate(schedulers):
-            scheduler.step(self.loss_by_step[i])
-            lrs.append(scheduler.get_last_lr()[0])
+        scheduler = self.lr_schedulers()
+        self.log("lr", scheduler.get_last_lr()[0], on_step=False, on_epoch=True)
         self.logger.experiment.add_scalars("train/accuracy",
                                            {f"t{i + 1}": self.accuracies[i] for i in range(0, self.seq_len, 3)},
                                            self.current_epoch)
-        self.logger.experiment.add_scalars("lr", {f"t{i + 1}": lrs[i] for i in range(0, self.seq_len, 3)},
-                                          self.current_epoch)
 
     def on_validation_epoch_start(self):
         logger.info(f"Start validation stage.")
@@ -269,7 +205,7 @@ class MultiRocket(pl.LightningModule):
         self.conf_matrix = torch.zeros(self.num_classes, self.num_classes)
 
     def validation_step(self, batch, batch_idx):
-        b = batch["sequence"].shape[0]
+        b = batch["rd_matrices"].shape[0]
         result = self.step(batch)
 
         self.loss = result["loss"]
@@ -291,6 +227,8 @@ class MultiRocket(pl.LightningModule):
         for i in range(len(accuracy_by_class)):
             self.log(f"val/acc_cls_{i}", accuracy_by_class[i], on_step=False, on_epoch=True, batch_size=b)
 
+        return self.loss
+
     def on_validation_epoch_end(self):
         self.accuracies /= self.count
         self.logger.experiment.add_scalars("val/accuracy",
@@ -309,7 +247,7 @@ class MultiRocket(pl.LightningModule):
         self.conf_matrix = torch.zeros(self.num_classes, self.num_classes)
 
     def test_step(self, batch, batch_idx):
-        b = batch["sequence"].shape[0]
+        b = batch["rd_matrices"].shape[0]
         result = self.step(batch, require_conf=True)
 
         self.loss = result["loss"]

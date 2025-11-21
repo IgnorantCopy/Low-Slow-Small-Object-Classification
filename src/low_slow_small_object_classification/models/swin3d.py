@@ -1,4 +1,3 @@
-import os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -394,8 +393,9 @@ class SwinTransformer3D(nn.Module):
         x = self.avg_pool(x).flatten(1)
         if extra_features is not None:
             x = torch.cat([x, extra_features], dim=1)
-        x = self.softmax(self.head(x))
-        return x
+        logits = self.head(x)
+        probs = self.softmax(logits)
+        return logits, probs
 
     def train(self, mode=True):
         super(SwinTransformer3D, self).train(mode)
@@ -445,8 +445,8 @@ class Swin3D(pl.LightningModule):
             extra_features[i, point_index[i] <= t].mean(0) for i in range(len(extra_features))
         ])
 
-        logits = self.model(rd_matrix_t, extra_features_t, mask_t)
-        return logits
+        probs = self.model(rd_matrix_t, extra_features_t, mask_t)[1]
+        return probs
 
     def step(self, batch, require_conf=False):
         rd_matrices = batch["rd_matrices"]
@@ -463,11 +463,11 @@ class Swin3D(pl.LightningModule):
         prediction = torch.zeros((b, self.seq_len))
         total_loss = 0.
         for t in range(1, self.seq_len + 1):
-            logits = self.forward(t, point_index, rd_matrices, extra_features, mask)
-            loss = self.weights[t - 1] * self.criterion(logits, labels)
+            probs = self.forward(t, point_index, rd_matrices, extra_features, mask)
+            loss = self.weights[t - 1] * self.criterion(probs, labels)
             total_loss += loss
 
-            _, pred = logits.max(1)
+            _, pred = probs.max(1)
             prediction[:, t - 1] = pred
             accuracy[t - 1] = (pred == labels).float().mean().item()
             for i in range(self.num_classes):

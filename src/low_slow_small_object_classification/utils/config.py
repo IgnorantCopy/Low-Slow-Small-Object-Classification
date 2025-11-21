@@ -32,6 +32,9 @@ def get_model(config) -> pl.LightningModule:
     elif model_name == 'MultiRocket':
         from src.low_slow_small_object_classification.models.multi_rocket import MultiRocket
         model = MultiRocket(config)
+    elif model_name == 'Stacking':
+        from src.low_slow_small_object_classification.models.stacking import StackingModule
+        model = StackingModule(config)
     else:
         raise ValueError(f'Model {model_name} not supported')
 
@@ -94,6 +97,9 @@ def get_datamodule(data_config):
     elif data_name == "track":
         from src.low_slow_small_object_classification.data.datasets import TrackDataModule
         datamodule = TrackDataModule(data_config)
+    elif data_name == "multi":
+        from src.low_slow_small_object_classification.data.datasets import MultiDataModule
+        datamodule = MultiDataModule(data_config)
     else:
         raise ValueError(f'Datamodule {data_name} not supported')
 
