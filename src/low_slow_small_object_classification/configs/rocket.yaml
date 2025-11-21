@@ -1,0 +1,35 @@
+model:
+  name: MultiRocket
+  c_in: 30
+  c_out: 4
+  seq_len: 29
+  num_features: 10000
+  dropout: 0.2
+  confidence_threshold: 0.9
+
+
+data:
+  name: track
+  data_root: /home/nju-student/mkh/datasets/radar
+  seed: 42
+  val_ratio: 0.2
+  shuffle: True
+  batch_size: 32
+  num_workers: 4
+  track_seq_len: 29
+  save_path: ../results
+
+
+train:
+  epochs: 100
+  lr: 0.01
+  scheduler:
+    name: ReduceLROnPlateau
+    factor: 0.5
+    patience: 10
+    gamma: 0.1
+  optimizer:
+    name: SGD
+    momentum: 0.9
+    weight_decay: 0.0005
+  log_dir: ../logs/track

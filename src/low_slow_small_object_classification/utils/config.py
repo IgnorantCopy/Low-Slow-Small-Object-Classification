@@ -29,6 +29,9 @@ def get_model(config) -> pl.LightningModule:
     if model_name == 'Swin3D':
         from src.low_slow_small_object_classification.models.swin3d import Swin3D
         model = Swin3D(config)
+    elif model_name == 'MultiRocket':
+        from src.low_slow_small_object_classification.models.multi_rocket import MultiRocket
+        model = MultiRocket(config)
     else:
         raise ValueError(f'Model {model_name} not supported')
 
@@ -88,6 +91,9 @@ def get_datamodule(data_config):
     if data_name == 'rd':
         from src.low_slow_small_object_classification.data.datasets import RDDataModule
         datamodule = RDDataModule(data_config)
+    elif data_name == "track":
+        from src.low_slow_small_object_classification.data.datasets import TrackDataModule
+        datamodule = TrackDataModule(data_config)
     else:
         raise ValueError(f'Datamodule {data_name} not supported')
 

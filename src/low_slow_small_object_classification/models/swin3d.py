@@ -12,6 +12,7 @@ from typing import Optional
 
 from src.low_slow_small_object_classification.utils.logger import default_logger as logger
 from src.low_slow_small_object_classification.utils.config import get_optimizer, get_scheduler
+from src.low_slow_small_object_classification.models.utils import calc_rate
 
 
 class FeedForward(nn.Module):
@@ -407,13 +408,9 @@ class Swin3D(pl.LightningModule):
 
         self.config = config
         model_config = config["model"]
-        model_config.pop("name")
+        model_config.pop("name", None)
         self.model = SwinTransformer3D(**model_config)
         self.automatic_optimization = False
-
-        self.save_path = config["data"].get("save_path", "")
-        if self.save_path:
-            os.makedirs(self.save_path, exist_ok=True)
 
         self.seq_len = config["data"]["track_seq_len"]
         self.criterion = nn.CrossEntropyLoss()
@@ -422,6 +419,8 @@ class Swin3D(pl.LightningModule):
         self.weights = self.weights / self.weights.sum()
         self.accuracies = torch.zeros(self.seq_len)
         self.count = 0
+        self.num_classes = model_config["num_classes"]
+        self.conf_matrix = torch.zeros(self.num_classes, self.num_classes)
 
     def configure_optimizers(self):
         train_config = self.config["train"]
@@ -429,15 +428,13 @@ class Swin3D(pl.LightningModule):
         scheduler = get_scheduler(train_config, optimizer)
         return [optimizer], [scheduler]
 
-    @staticmethod
-    def _calc_rate(predictions):
-        rate = 0.
+    def update_conf_matrix(self, predictions, labels):
         for i in range(len(predictions)):
             pred = predictions[i]
             unique_values, counts = torch.unique(pred, return_counts=True)
             pred_label = unique_values[counts.argmax()]
-            rate += len(pred[pred == pred_label]) / len(pred)
-        return rate / len(predictions)
+            label = labels[i]
+            self.conf_matrix[int(label), int(pred_label)] += 1
 
     def forward(self, t, point_index: torch.Tensor, rd_matrices: torch.Tensor,
                 extra_features: Optional[torch.Tensor] = None, mask: Optional[torch.Tensor] = None):
@@ -451,7 +448,7 @@ class Swin3D(pl.LightningModule):
         logits = self.model(rd_matrix_t, extra_features_t, mask_t)
         return logits
 
-    def step(self, batch):
+    def step(self, batch, require_conf=False):
         rd_matrices = batch["rd_matrices"]
         point_index = batch["point_index"]
         extra_features = batch["extra_features"]
@@ -460,6 +457,7 @@ class Swin3D(pl.LightningModule):
 
         b = point_index.shape[0]
         accuracy = torch.zeros(self.seq_len)
+        accuracy_by_class = torch.zeros(self.num_classes, self.seq_len)
         begin_time = torch.ones(b) * self.seq_len
         begin = [False for _ in range(b)]
         prediction = torch.zeros((b, self.seq_len))
@@ -472,24 +470,41 @@ class Swin3D(pl.LightningModule):
             _, pred = logits.max(1)
             prediction[:, t - 1] = pred
             accuracy[t - 1] = (pred == labels).float().mean().item()
+            for i in range(self.num_classes):
+                accuracy_by_class[i, t - 1] = (pred[labels == i] == i).float().mean().item()
 
             for i in range(b):
                 if not begin[i] and pred[i] == labels[i]:
                     begin_time[i] = t
                     begin[i] = True
 
-        return {
+        rate, strict_prediction = calc_rate(prediction)
+        strict_prediction = strict_prediction.to(labels)
+        strict_accuracy = (strict_prediction == labels).float().mean().item()
+
+        accuracy = torch.nan_to_num(accuracy, nan=0.0)
+        accuracy_by_class = torch.nan_to_num(accuracy_by_class, nan=0.0)
+
+        result = {
             "loss": total_loss,
             "begin_time": begin_time.mean(),
-            "rate": self._calc_rate(prediction),
+            "rate": rate,
             "accuracy": accuracy,
+            "accuracy_by_class": accuracy_by_class.mean(1),
+            "strict_accuracy": strict_accuracy,
         }
+
+        if require_conf:
+            self.update_conf_matrix(prediction, labels)
+        result["conf_matrix"] = self.conf_matrix.clone()
+        return result
 
     def on_train_epoch_start(self):
         logger.info(f"Epoch {self.current_epoch} starts.")
         logger.info(f"Start training stage.")
         self.accuracies = torch.zeros(self.seq_len)
         self.count = 0
+        self.conf_matrix = torch.zeros(self.num_classes, self.num_classes)
 
     def training_step(self, batch, batch_idx):
         b = batch["rd_matrices"].shape[0]
@@ -499,9 +514,10 @@ class Swin3D(pl.LightningModule):
         begin_time = result["begin_time"]
         rate = result["rate"]
         accuracy = result["accuracy"]
+        accuracy_by_class = result["accuracy_by_class"]
+        strict_accuracy = result["strict_accuracy"]
         self.accuracies += b * accuracy
         self.count += b
-        self.loss += nn.MSELoss()(begin_time, torch.ones_like(begin_time)) / self.seq_len ** 2
 
         optimizer = self.optimizers()
         optimizer.zero_grad()
@@ -511,12 +527,17 @@ class Swin3D(pl.LightningModule):
         self.log_dict({
             "train/loss": self.loss,
             "train/avg_accuracy": accuracy.mean(),
+            "train/strict_accuracy": strict_accuracy,
             "train/begin_time": begin_time.mean(),
             "train/rate": rate,
         }, on_step=False, on_epoch=True, batch_size=b)
+        for i in range(len(accuracy_by_class)):
+            self.log(f"train/acc_cls_{i}", accuracy_by_class[i], on_step=False, on_epoch=True, batch_size=b)
 
     def on_train_epoch_end(self):
-        # self.accuracies /= self.count
+        scheduler = self.lr_schedulers()
+        scheduler.step()
+        self.log("lr", scheduler.get_last_lr()[0], on_step=False, on_epoch=True)
         self.logger.experiment.add_scalars("train/accuracy",
                                            {f"t{i + 1}": self.accuracies[i] for i in range(0, self.seq_len, 3)},
                                            self.current_epoch)
@@ -525,6 +546,7 @@ class Swin3D(pl.LightningModule):
         logger.info(f"Start validation stage.")
         self.accuracies = torch.zeros(self.seq_len)
         self.count = 0
+        self.conf_matrix = torch.zeros(self.num_classes, self.num_classes)
 
     def validation_step(self, batch, batch_idx):
         b = batch["rd_matrices"].shape[0]
@@ -534,22 +556,22 @@ class Swin3D(pl.LightningModule):
         begin_time = result["begin_time"]
         rate = result["rate"]
         accuracy = result["accuracy"]
+        accuracy_by_class = result["accuracy_by_class"]
+        strict_accuracy = result["strict_accuracy"]
         self.accuracies += b * accuracy
         self.count += b
-        self.loss += nn.MSELoss()(begin_time, torch.ones_like(begin_time)) / self.seq_len ** 2
 
         self.log_dict({
             "val/loss": self.loss,
             "val/avg_accuracy": accuracy.mean(),
+            "val/strict_accuracy": strict_accuracy,
             "val/begin_time": begin_time.mean(),
             "val/rate": rate,
         }, on_step=False, on_epoch=True, batch_size=b)
+        for i in range(len(accuracy_by_class)):
+            self.log(f"val/acc_cls_{i}", accuracy_by_class[i], on_step=False, on_epoch=True, batch_size=b)
 
     def on_validation_epoch_end(self):
-        scheduler = self.lr_schedulers()
-        scheduler.step()
-        self.log("lr", scheduler.get_last_lr()[0], on_step=False, on_epoch=True)
-
         self.accuracies /= self.count
         self.logger.experiment.add_scalars("val/accuracy",
                                            {f"t{i + 1}": self.accuracies[i] for i in range(0, self.seq_len, 3)},
@@ -564,25 +586,30 @@ class Swin3D(pl.LightningModule):
     def on_test_epoch_start(self):
         self.accuracies = torch.zeros(self.seq_len)
         self.count = 0
+        self.conf_matrix = torch.zeros(self.num_classes, self.num_classes)
 
     def test_step(self, batch, batch_idx):
         b = batch["rd_matrices"].shape[0]
-        result = self.step(batch)
+        result = self.step(batch, require_conf=True)
 
         self.loss = result["loss"]
         begin_time = result["begin_time"]
         rate = result["rate"]
         accuracy = result["accuracy"]
+        strict_accuracy = result["strict_accuracy"]
+        accuracy_by_class = result["accuracy_by_class"]
         self.accuracies += b * accuracy
         self.count += b
-        self.loss += nn.MSELoss()(begin_time, torch.ones_like(begin_time)) / self.seq_len ** 2
 
         self.log_dict({
             "test/loss": self.loss,
             "test/avg_accuracy": accuracy.mean(),
+            "test/strict_accuracy": strict_accuracy,
             "test/begin_time": begin_time.mean(),
             "test/rate": rate,
         }, on_step=True, on_epoch=True, batch_size=b)
+        for i in range(len(accuracy_by_class)):
+            self.log(f"test/acc_cls_{i}", accuracy_by_class[i], on_step=True, on_epoch=True, batch_size=b)
 
     def on_test_epoch_end(self):
         self.accuracies /= self.count
@@ -591,7 +618,7 @@ class Swin3D(pl.LightningModule):
                                            self.current_epoch)
 
     def on_test_start(self):
-        self.extra_logger.info("Start testing.")
+        logger.info("Start testing.")
 
     def on_test_end(self):
-        self.extra_logger.info(f"Testing finished.")
+        logger.info(f"Testing finished.")

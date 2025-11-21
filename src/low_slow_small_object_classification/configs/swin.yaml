@@ -30,16 +30,16 @@ data:
   track_seq_len: 20
   height: 32
   width: 544
-  save_path: ./results
+  save_path: ../results
 
 
 train:
-  epochs: 1400
+  epochs: 1500
   lr: 0.01
   scheduler:
-    name: MultiStepLR
-    gamma: 0.5
-    milestones: [ 500, 800, 1000, 1200 ]
+    name: CosineAnnealingWarmRestarts
+    T_0: 1500
+    eta_min: 0.0001
   optimizer:
     name: SGD
     momentum: 0.9
